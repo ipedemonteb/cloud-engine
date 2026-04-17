@@ -1,2 +1,33 @@
-# Directories
-data
+# macOS
+.DS_Store
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.pyre/
+
+# Build/distribution artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environment/config files
+.env
+.env.*
+.python-version
+
+# Local data outputs
+data/
+data_processed/
