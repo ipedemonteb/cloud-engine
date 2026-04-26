@@ -34,7 +34,7 @@ from preprocessing.targets import generar_targets
 
 # ── Configuración de rutas ───────────────────────────────────────────────────
 
-ROOT          = Path(__file__).resolve().parent.parent
+ROOT          = Path(__file__).resolve().parents[2]
 DATA_DIR      = ROOT / 'data'
 OUTPUT_DIR    = ROOT / 'data_processed'
 
