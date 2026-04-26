@@ -1,0 +1,309 @@
+"""
+balance_dataset.py
+------------------
+Genera un dataset de entrenamiento balanceado por bins de score_crediticio.
+
+Objetivo
+--------
+Partiendo de data_processed/dataset_final.csv (muy grande y desbalanceado),
+construye un CSV mas chico para entrenamiento donde cada bin de score tenga
+la misma cantidad de filas (downsampling), evitando que la mayoria domine.
+
+Bins usados (por defecto):
+    - b0: [0.00, 0.25)
+    - b1: [0.25, 0.50)
+    - b2: [0.50, 0.75)
+    - b3: [0.75, 1.00]
+
+El script hace 2 pasadas en chunks:
+1) Cuenta cuantas filas hay por bin.
+2) Selecciona filas por bin con muestreo exacto (sin reemplazo) y escribe
+   directo a disco para no cargar todo en RAM.
+
+Uso ejemplo (desde src/):
+    uv run python -m preprocessing.balance_dataset
+
+    uv run python -m preprocessing.balance_dataset \
+        --max-total-rows 2000000 \
+        --output ../data_processed/dataset_train_balanced_2m.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_INPUT = ROOT / "data_processed" / "dataset_final.csv"
+DEFAULT_OUTPUT = ROOT / "data_processed" / "dataset_train_balanced.csv"
+
+TARGET_COLUMN = "score_crediticio"
+BIN_EDGES = [-0.000001, 0.25, 0.50, 0.75, 1.000001]
+BIN_LABELS = ["b0_0_025", "b1_025_050", "b2_050_075", "b3_075_100"]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Balancea dataset_final.csv por bins de score_crediticio"
+    )
+    parser.add_argument("--input", default=str(DEFAULT_INPUT), help="CSV de entrada")
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="CSV de salida")
+    parser.add_argument(
+        "--target-col",
+        default=TARGET_COLUMN,
+        help="Nombre de la columna target",
+    )
+    parser.add_argument(
+        "--chunksize",
+        type=int,
+        default=500_000,
+        help="Filas por chunk para lectura",
+    )
+    parser.add_argument(
+        "--rows-per-bin",
+        type=int,
+        default=None,
+        help="Filas objetivo por bin (si no se indica, usa el minimo entre bins)",
+    )
+    parser.add_argument(
+        "--max-total-rows",
+        type=int,
+        default=None,
+        help="Tope total de filas del dataset de salida (reparte parejo entre 4 bins)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Semilla aleatoria")
+    parser.add_argument(
+        "--include-bin-col",
+        action="store_true",
+        help="Si se indica, agrega columna score_bin al CSV de salida",
+    )
+    return parser.parse_args()
+
+
+def _as_bin_codes(score: pd.Series) -> pd.Series:
+    binned = pd.cut(
+        score,
+        bins=BIN_EDGES,
+        labels=BIN_LABELS,
+        right=False,
+        include_lowest=True,
+    )
+
+    if binned.isna().any():
+        invalidas = int(binned.isna().sum())
+        raise ValueError(
+            f"Se encontraron {invalidas:,} filas con target fuera de rango [0.0, 1.0]"
+        )
+
+    return binned
+
+
+def _contar_bins(path: Path, target_col: str, chunksize: int) -> dict[str, int]:
+    counts = {label: 0 for label in BIN_LABELS}
+    filas = 0
+
+    reader = pd.read_csv(path, usecols=[target_col], chunksize=chunksize)
+    for chunk in reader:
+        if chunk[target_col].isna().any():
+            raise ValueError("El dataset contiene NaN en el target")
+
+        bins = _as_bin_codes(chunk[target_col].astype(float))
+        vc = bins.value_counts()
+        for label in BIN_LABELS:
+            counts[label] += int(vc.get(label, 0))
+
+        filas += len(chunk)
+
+    print("Conteo por bin (dataset completo):")
+    for label in BIN_LABELS:
+        cnt = counts[label]
+        pct = (cnt / filas * 100.0) if filas else 0.0
+        print(f"  {label:>10}: {cnt:>12,} ({pct:5.2f}%)")
+    print(f"  {'TOTAL':>10}: {filas:>12,}")
+
+    return counts
+
+
+def _resolver_objetivo_por_bin(
+    counts: dict[str, int],
+    rows_per_bin: int | None,
+    max_total_rows: int | None,
+) -> dict[str, int]:
+    if rows_per_bin is not None and max_total_rows is not None:
+        raise ValueError("Usar solo uno: --rows-per-bin o --max-total-rows")
+
+    min_bin = min(counts.values())
+    if min_bin <= 0:
+        vacios = [k for k, v in counts.items() if v == 0]
+        raise ValueError(f"No se puede balancear: bins vacios: {', '.join(vacios)}")
+
+    if rows_per_bin is not None:
+        if rows_per_bin <= 0:
+            raise ValueError("--rows-per-bin debe ser > 0")
+        objetivo = rows_per_bin
+    elif max_total_rows is not None:
+        if max_total_rows <= 0:
+            raise ValueError("--max-total-rows debe ser > 0")
+        objetivo = max_total_rows // len(BIN_LABELS)
+        if objetivo <= 0:
+            raise ValueError("--max-total-rows es demasiado chico para 4 bins")
+    else:
+        objetivo = min_bin
+
+    objetivo_por_bin: dict[str, int] = {}
+    for label in BIN_LABELS:
+        objetivo_por_bin[label] = min(objetivo, counts[label])
+
+    return objetivo_por_bin
+
+
+def _samplear_y_exportar(
+    input_path: Path,
+    output_path: Path,
+    target_col: str,
+    chunksize: int,
+    objetivo_por_bin: dict[str, int],
+    seed: int,
+    include_bin_col: bool,
+) -> dict[str, int]:
+    rng = np.random.default_rng(seed)
+
+    remaining_needed = dict(objetivo_por_bin)
+    remaining_pool = _contar_bins(input_path, target_col, chunksize)
+    selected_counts = {label: 0 for label in BIN_LABELS}
+
+    if output_path.exists():
+        output_path.unlink()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    write_header = True
+    chunks = 0
+
+    reader = pd.read_csv(input_path, chunksize=chunksize)
+    for chunk in reader:
+        chunks += 1
+        bins = _as_bin_codes(chunk[target_col].astype(float))
+        selected_positions: list[np.ndarray] = []
+
+        for label in BIN_LABELS:
+            pos = np.flatnonzero((bins == label).to_numpy())
+            n = int(pos.size)
+            if n == 0:
+                continue
+
+            need = remaining_needed[label]
+            pool = remaining_pool[label]
+
+            if need < 0 or pool < need:
+                raise RuntimeError(f"Estado invalido para {label}: need={need}, pool={pool}")
+
+            if need == 0:
+                remaining_pool[label] -= n
+                continue
+
+            if need == pool:
+                k = n
+            else:
+                bad = pool - need
+                k = int(rng.hypergeometric(ngood=need, nbad=bad, nsample=n))
+
+            if k > 0:
+                if k == n:
+                    picked = pos
+                else:
+                    choice = rng.choice(n, size=k, replace=False)
+                    picked = pos[choice]
+                selected_positions.append(picked)
+                selected_counts[label] += k
+
+            remaining_needed[label] -= k
+            remaining_pool[label] -= n
+
+        if selected_positions:
+            all_pos = np.sort(np.concatenate(selected_positions))
+            out_chunk = chunk.iloc[all_pos].copy()
+            if include_bin_col:
+                out_chunk["score_bin"] = bins.iloc[all_pos].astype(str).to_numpy()
+
+            out_chunk.to_csv(
+                output_path,
+                mode="w" if write_header else "a",
+                header=write_header,
+                index=False,
+            )
+            write_header = False
+
+        if chunks % 10 == 0:
+            parcial = sum(selected_counts.values())
+            print(
+                f"  chunk {chunks:4d} | filas seleccionadas: {parcial:>12,}",
+                end="\r",
+            )
+
+    print()
+
+    pendientes = {k: v for k, v in remaining_needed.items() if v != 0}
+    if pendientes:
+        raise RuntimeError(f"No se pudo completar el muestreo exacto: {pendientes}")
+
+    return selected_counts
+
+
+def main() -> None:
+    args = parse_args()
+
+    input_path = Path(args.input).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"No se encontro archivo de entrada: {input_path}")
+
+    print("=" * 70)
+    print("  Balanceo de dataset_final por bins de score_crediticio")
+    print("=" * 70)
+    print(f"Input:  {input_path}")
+    print(f"Output: {output_path}")
+    print(f"Target: {args.target_col}")
+    print(f"Chunk:  {args.chunksize:,} filas")
+
+    counts = _contar_bins(input_path, args.target_col, args.chunksize)
+    objetivo_por_bin = _resolver_objetivo_por_bin(
+        counts,
+        rows_per_bin=args.rows_per_bin,
+        max_total_rows=args.max_total_rows,
+    )
+
+    print("\nObjetivo por bin (train balanceado):")
+    for label in BIN_LABELS:
+        print(f"  {label:>10}: {objetivo_por_bin[label]:>12,}")
+    print(f"  {'TOTAL':>10}: {sum(objetivo_por_bin.values()):>12,}")
+
+    print("\nMuestreando y exportando...")
+    selected = _samplear_y_exportar(
+        input_path=input_path,
+        output_path=output_path,
+        target_col=args.target_col,
+        chunksize=args.chunksize,
+        objetivo_por_bin=objetivo_por_bin,
+        seed=args.seed,
+        include_bin_col=args.include_bin_col,
+    )
+
+    total = sum(selected.values())
+    print("\nResultado final:")
+    for label in BIN_LABELS:
+        cnt = selected[label]
+        pct = cnt / total * 100.0 if total else 0.0
+        print(f"  {label:>10}: {cnt:>12,} ({pct:5.2f}%)")
+    print(f"  {'TOTAL':>10}: {total:>12,}")
+    print(f"\n✓ Dataset balanceado guardado en: {output_path}")
+    print("  Para entrenar:")
+    print(f"  uv run python src/model/train_model.py --dataset {output_path}")
+
+
+if __name__ == "__main__":
+    main()
