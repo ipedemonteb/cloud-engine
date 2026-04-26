@@ -15,7 +15,6 @@ Estrategia:
 """
 
 import pandas as pd
-import numpy as np
 from pathlib import Path
 from collections import defaultdict
 import tempfile
@@ -483,104 +482,265 @@ def _parse_monto_24dsf(valor: str) -> float:
         return 0.0
 
 
-def _procesar_chunk_24dsf(chunk: pd.DataFrame, acum: dict) -> None:
+def _parse_situacion_24dsf(valor: str) -> int | None:
+    sit = pd.to_numeric(valor, errors='coerce')
+    if pd.isna(sit):
+        return None
+    sit = int(sit)
+    return sit if 1 <= sit <= 5 else None
+
+
+def features_desde_api(response_json: dict) -> dict | None:
+    """
+    Transforma la respuesta de /Deudas/Historicas/{CUIT} en un diccionario
+    de features listo para el modelo.
+
+    Parametros
+    ----------
+    response_json : dict
+        Contenido del campo 'results' de la respuesta de la API del BCRA.
+
+    Retorna
+    -------
+    dict con todas las features del modelo en el mismo formato que el CSV
+    de entrenamiento, o None si no hay datos suficientes (menos de 7 periodos).
+    """
+    periodos = response_json.get('periodos', [])
+    if len(periodos) < 7:
+        return None
+
+    meses = []
+    for p in periodos:
+        entidades = p.get('entidades', [])
+        if not entidades:
+            continue
+
+        situaciones = [
+            _parse_situacion_24dsf(e.get('situacion'))
+            for e in entidades
+        ]
+        situaciones_validas = [s for s in situaciones if s is not None]
+        if not situaciones_validas:
+            continue
+
+        meses.append({
+            'periodo': p.get('periodo'),
+            'situacion_max': max(situaciones_validas),
+            'monto_total': sum(_parse_monto_24dsf(e.get('monto', 0)) for e in entidades),
+            'dias_atraso_max': max(int(e.get('diasAtrasoPago') or 0) for e in entidades),
+            'refinanciado': any(e.get('refinanciaciones') for e in entidades),
+            'proceso_judicial': any(e.get('procesoJud') for e in entidades),
+            'recategorizado': any(e.get('recategorizacionOblig') for e in entidades),
+            'irrecuperable': any(e.get('irrecDisposicionTecnica') for e in entidades),
+            'cant_entidades': len(entidades),
+        })
+
+    if len(meses) < 7:
+        return None
+
+    mes_actual = meses[0]
+    hist = meses[6:]
+
+    features = {
+        'situacion': mes_actual['situacion_max'],
+        'prestamos_total': mes_actual['monto_total'],
+        'dias_atraso_max': mes_actual['dias_atraso_max'],
+        'tiene_garantia_a': 0,
+        'ratio_cobertura': 0.0,
+        'refinanciado': int(mes_actual['refinanciado']),
+        'proceso_judicial': int(mes_actual['proceso_judicial']),
+        'recategorizado': int(mes_actual['recategorizado']),
+        'irrecuperable': int(mes_actual['irrecuperable']),
+        'cant_entidades': mes_actual['cant_entidades'],
+    }
+
+    sits = [m['situacion_max'] for m in hist]
+    montos = [m['monto_total'] for m in hist]
+
+    meses_en_sit1 = sum(1 for s in sits if s == 1)
+    meses_sit_mala = sum(1 for s in sits if s >= 3)
+    peor_situacion_24m = max(sits) if sits else None
+    if len(sits) >= 4:
+        bloque = sits[3:12]
+        tendencia = round((sum(sits[:3]) / 3) - (sum(bloque) / len(bloque)), 3)
+    else:
+        tendencia = 0.0
+
+    racha = 0
+    for s in sits:
+        if s == 1:
+            racha += 1
+        else:
+            break
+
+    monto_actual_hist = montos[0] if len(montos) >= 1 else 0
+    monto_hace_12 = montos[11] if len(montos) >= 12 else (montos[-1] if montos else 0)
+    variacion_monto_12m = (
+        round((monto_actual_hist - monto_hace_12) / monto_hace_12, 3)
+        if monto_hace_12 > 0
+        else 0.0
+    )
+
+    monto_promedio_24m = round(sum(montos) / len(montos), 1) if montos else 0.0
+    monto_max_24m = max(montos) if montos else 0.0
+    meses_con_deuda = sum(1 for m in montos if m > 0)
+
+    features.update({
+        'meses_en_sit1': meses_en_sit1,
+        'meses_sit_mala': meses_sit_mala,
+        'peor_situacion_24m': peor_situacion_24m,
+        'tendencia_situacion': tendencia,
+        'racha_sit1_actual': racha,
+        'variacion_monto_12m': variacion_monto_12m,
+        'monto_promedio_24m': monto_promedio_24m,
+        'monto_max_24m': monto_max_24m,
+        'meses_con_deuda': meses_con_deuda,
+        'actividad': 'desconocido',
+    })
+
+    return features
+
+
+def _procesar_chunk_24dsf(chunk: pd.DataFrame, acum: dict, target_sits: dict) -> None:
     """
     Procesa un chunk del 24DSF y acumula features temporales por CUIT.
-    Calcula directamente los agregados para no guardar filas individuales.
+    Separa meses 1-6 (target) y meses 7-24 (features) para evitar leakage.
     """
-    sit_cols   = [f'sit_m{i:02d}' for i in range(1, 25)]
-    monto_cols = [f'monto_m{i:02d}' for i in range(1, 25)]
-
     for row in chunk.itertuples(index=False):
         cuit = str(row.nro_id).strip()
         if not cuit:
             continue
 
-        # Extraer situaciones y montos de los 24 meses
-        sits   = []
+        if cuit not in target_sits:
+            target_sits[cuit] = [None] * 6
+
+        if cuit not in acum:
+            acum[cuit] = {
+                'sits_7_24': [None] * 18,
+                'montos_7_24': [0.0] * 18,
+            }
+
+        for i in range(1, 25):
+            sit = _parse_situacion_24dsf(getattr(row, f'sit_m{i:02d}', None))
+
+            if i <= 6:
+                if sit is None:
+                    continue
+
+                prev = target_sits[cuit][i - 1]
+                target_sits[cuit][i - 1] = sit if prev is None else max(prev, sit)
+                continue
+
+            if sit is None:
+                continue
+
+            idx = i - 7
+            prev = acum[cuit]['sits_7_24'][idx]
+            acum[cuit]['sits_7_24'][idx] = sit if prev is None else max(prev, sit)
+            acum[cuit]['montos_7_24'][idx] += _parse_monto_24dsf(getattr(row, f'monto_m{i:02d}', 0))
+
+
+def _features_temporales_desde_acum(acum: dict) -> pd.DataFrame:
+    columnas = [
+        'nro_id',
+        'meses_en_sit1',
+        'meses_sit_mala',
+        'peor_situacion_24m',
+        'tendencia_situacion',
+        'racha_sit1_actual',
+        'variacion_monto_12m',
+        'monto_promedio_24m',
+        'monto_max_24m',
+        'meses_con_deuda',
+    ]
+
+    filas = []
+    for cuit, valores in acum.items():
+        sits = []
         montos = []
-        for i, (sc, mc) in enumerate(zip(sit_cols, monto_cols)):
-            s = pd.to_numeric(getattr(row, sc, None), errors='coerce')
-            m = _parse_monto_24dsf(getattr(row, mc, 0))
-            if pd.notna(s) and s > 0:
-                sits.append(int(s))
-                montos.append(m)
-            else:
-                sits.append(None)
-                montos.append(None)
+        for sit, monto in zip(valores['sits_7_24'], valores['montos_7_24']):
+            if sit is None:
+                continue
+            sits.append(sit)
+            montos.append(monto)
 
-        # Calcular features temporales
-        sits_validos   = [s for s in sits   if s is not None]
-        montos_validos = [m for m in montos if m is not None]
-
-        if not sits_validos:
+        if not sits:
             continue
 
-        sits_arr = np.array(sits_validos)
+        meses_en_sit1 = sum(1 for s in sits if s == 1)
+        meses_sit_mala = sum(1 for s in sits if s >= 3)
+        peor_situacion_24m = max(sits)
 
-        meses_en_sit1    = int((sits_arr == 1).sum())
-        meses_sit_mala   = int((sits_arr >= 3).sum())
-        peor_situacion   = int(sits_arr.max())
-        meses_con_deuda  = int(sum(1 for m in montos_validos if m and m > 0))
+        if len(sits) >= 4:
+            bloque = sits[3:12]
+            tendencia = round((sum(sits[:3]) / 3) - (sum(bloque) / len(bloque)), 3)
+        else:
+            tendencia = 0.0
 
-        # Tendencia: promedio últimos 3m vs meses 4-12
-        ultimos_3  = np.mean(sits_arr[:3])  if len(sits_arr) >= 3 else sits_arr.mean()
-        anteriores = np.mean(sits_arr[3:12]) if len(sits_arr) > 3  else sits_arr.mean()
-        tendencia  = round(float(ultimos_3 - anteriores), 3)
-
-        # Racha actual en situación 1
         racha = 0
-        for s in sits_arr:
+        for s in sits:
             if s == 1:
                 racha += 1
             else:
                 break
 
-        # Evolución de monto
-        montos_arr     = np.array([m for m in montos_validos if m is not None])
-        monto_actual   = montos_arr[0]  if len(montos_arr) >= 1  else 0
-        monto_hace_12  = montos_arr[11] if len(montos_arr) >= 12 else montos_arr[-1]
-        variacion_12m  = round(
-            float((monto_actual - monto_hace_12) / monto_hace_12), 3
-        ) if monto_hace_12 > 0 else 0.0
+        monto_actual_hist = montos[0] if len(montos) >= 1 else 0
+        monto_hace_12 = montos[11] if len(montos) >= 12 else (montos[-1] if montos else 0)
+        variacion_monto_12m = (
+            round((monto_actual_hist - monto_hace_12) / monto_hace_12, 3)
+            if monto_hace_12 > 0
+            else 0.0
+        )
 
-        monto_promedio = round(float(montos_arr.mean()), 1) if len(montos_arr) > 0 else 0.0
-        monto_max      = float(montos_arr.max())            if len(montos_arr) > 0 else 0.0
+        monto_promedio_24m = round(sum(montos) / len(montos), 1) if montos else 0.0
+        monto_max_24m = max(montos) if montos else 0.0
+        meses_con_deuda = sum(1 for m in montos if m > 0)
 
-        # Si el CUIT ya fue visto en un chunk anterior, tomamos el peor caso
-        # (puede aparecer en múltiples entidades)
-        if cuit in acum:
-            a = acum[cuit]
-            acum[cuit] = {
-                'meses_en_sit1':       min(a['meses_en_sit1'],      meses_en_sit1),
-                'meses_sit_mala':      max(a['meses_sit_mala'],     meses_sit_mala),
-                'peor_situacion_24m':  max(a['peor_situacion_24m'], peor_situacion),
-                'tendencia_situacion': max(a['tendencia_situacion'],tendencia),
-                'racha_sit1_actual':   min(a['racha_sit1_actual'],  racha),
-                'variacion_monto_12m': a['variacion_monto_12m'],
-                'monto_promedio_24m':  round((a['monto_promedio_24m'] + monto_promedio) / 2, 1),
-                'monto_max_24m':       max(a['monto_max_24m'],      monto_max),
-                'meses_con_deuda':     max(a['meses_con_deuda'],    meses_con_deuda),
-            }
-        else:
-            acum[cuit] = {
-                'meses_en_sit1':       meses_en_sit1,
-                'meses_sit_mala':      meses_sit_mala,
-                'peor_situacion_24m':  peor_situacion,
-                'tendencia_situacion': tendencia,
-                'racha_sit1_actual':   racha,
-                'variacion_monto_12m': variacion_12m,
-                'monto_promedio_24m':  monto_promedio,
-                'monto_max_24m':       monto_max,
-                'meses_con_deuda':     meses_con_deuda,
-            }
+        filas.append({
+            'nro_id': cuit,
+            'meses_en_sit1': meses_en_sit1,
+            'meses_sit_mala': meses_sit_mala,
+            'peor_situacion_24m': peor_situacion_24m,
+            'tendencia_situacion': tendencia,
+            'racha_sit1_actual': racha,
+            'variacion_monto_12m': variacion_monto_12m,
+            'monto_promedio_24m': monto_promedio_24m,
+            'monto_max_24m': monto_max_24m,
+            'meses_con_deuda': meses_con_deuda,
+        })
+
+    return pd.DataFrame(filas, columns=columnas)
+
+
+def _targets_desde_sits(target_sits: dict) -> pd.DataFrame:
+    try:
+        from preprocessing.targets import calcular_score
+    except ImportError:
+        from targets import calcular_score
+
+    filas = []
+    for cuit, sits in target_sits.items():
+        if len([s for s in sits if s is not None]) < 3:
+            continue
+
+        score = calcular_score(sits)
+        if score is None:
+            continue
+
+        filas.append({
+            'nro_id': cuit,
+            'score_crediticio': score,
+        })
+
+    return pd.DataFrame(filas, columns=['nro_id', 'score_crediticio'])
 
 
 def _cargar_24dsf_en_memoria(
     path: Path,
     persona_humana_only: bool,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     acum = {}
+    target_sits = {}
     chunks_proc = 0
     filas_proc = 0
     filas_descartadas = 0
@@ -604,7 +764,7 @@ def _cargar_24dsf_en_memoria(
             chunks_proc += 1
             continue
 
-        _procesar_chunk_24dsf(chunk, acum)
+        _procesar_chunk_24dsf(chunk, acum, target_sits)
 
         chunks_proc += 1
         filas_proc += len(chunk)
@@ -622,13 +782,14 @@ def _cargar_24dsf_en_memoria(
         print(f"    Filas descartadas (no persona humana): {filas_descartadas:,}")
     print(f"    CUITs únicos encontrados : {len(acum):,}")
 
-    df = pd.DataFrame.from_dict(acum, orient='index')
-    df.index.name = 'nro_id'
-    df = df.reset_index()
+    df = _features_temporales_desde_acum(acum)
+    df_target = _targets_desde_sits(target_sits)
 
     del acum
+    del target_sits
     print(f"    DataFrame final          : {df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
-    return df
+    print(f"    CUITs con target valido  : {len(df_target):,}")
+    return df, df_target
 
 
 def _particionar_24dsf(
@@ -689,22 +850,26 @@ def _particionar_24dsf(
     return bucket_paths, filas_proc, filas_descartadas
 
 
-def _reducir_24dsf_buckets(bucket_paths: list[Path]) -> pd.DataFrame:
+def _reducir_24dsf_buckets(bucket_paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
     frames = []
+    target_frames = []
     buckets_con_datos = [p for p in bucket_paths if p.exists()]
 
     for i, bucket_path in enumerate(buckets_con_datos, start=1):
         acum = {}
+        target_sits = {}
 
         reader = pd.read_csv(bucket_path, dtype=str, chunksize=CHUNK_SIZE)
         for chunk in reader:
-            _procesar_chunk_24dsf(chunk, acum)
+            _procesar_chunk_24dsf(chunk, acum, target_sits)
 
         if acum:
-            bucket_df = pd.DataFrame.from_dict(acum, orient='index')
-            bucket_df.index.name = 'nro_id'
-            bucket_df = bucket_df.reset_index()
+            bucket_df = _features_temporales_desde_acum(acum)
             frames.append(bucket_df)
+
+        if target_sits:
+            bucket_target = _targets_desde_sits(target_sits)
+            target_frames.append(bucket_target)
 
         print(
             f"  bucket {i:3d}/{len(buckets_con_datos):3d} | "
@@ -714,27 +879,23 @@ def _reducir_24dsf_buckets(bucket_paths: list[Path]) -> pd.DataFrame:
 
     print()
     if not frames:
-        return pd.DataFrame(columns=[
-            'nro_id',
-            'meses_en_sit1',
-            'meses_sit_mala',
-            'peor_situacion_24m',
-            'tendencia_situacion',
-            'racha_sit1_actual',
-            'variacion_monto_12m',
-            'monto_promedio_24m',
-            'monto_max_24m',
-            'meses_con_deuda',
-        ])
+        df_features = _features_temporales_desde_acum({})
+    else:
+        df_features = pd.concat(frames, ignore_index=True)
 
-    return pd.concat(frames, ignore_index=True)
+    if target_frames:
+        df_target = pd.concat(target_frames, ignore_index=True)
+    else:
+        df_target = _targets_desde_sits({})
+
+    return df_features, df_target
 
 
 def _cargar_24dsf_low_ram(
     path: Path,
     buckets: int = LOW_RAM_BUCKETS,
     persona_humana_only: bool = False,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     print(f"  Modo low-RAM activado ({buckets} buckets temporales)")
     with tempfile.TemporaryDirectory(prefix='bcra_24dsf_') as tmp:
         tmp_dir = Path(tmp)
@@ -744,15 +905,16 @@ def _cargar_24dsf_low_ram(
             buckets,
             persona_humana_only,
         )
-        df = _reducir_24dsf_buckets(bucket_paths)
+        df_features, df_target = _reducir_24dsf_buckets(bucket_paths)
 
     print("  ✓ Reducción de buckets completa")
     print(f"    Filas totales procesadas : {filas_proc:,}")
     if persona_humana_only:
         print(f"    Filas descartadas (no persona humana): {filas_descartadas:,}")
-    print(f"    CUITs únicos encontrados : {len(df):,}")
-    print(f"    DataFrame final          : {df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
-    return df
+    print(f"    CUITs únicos encontrados : {len(df_features):,}")
+    print(f"    DataFrame final          : {df_features.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+    print(f"    CUITs con target valido  : {len(df_target):,}")
+    return df_features, df_target
 
 
 def cargar_24dsf(
@@ -760,10 +922,12 @@ def cargar_24dsf(
     low_ram: bool | None = None,
     buckets: int = LOW_RAM_BUCKETS,
     persona_humana_only: bool = False,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Carga 24DSF.txt procesando en chunks.
-    Devuelve un DataFrame con una fila por CUIT con features temporales.
+    Devuelve una tupla con:
+        - DataFrame de features temporales por CUIT (meses 7..24)
+        - DataFrame target por CUIT con ['nro_id', 'score_crediticio']
 
     Parámetros
     ----------

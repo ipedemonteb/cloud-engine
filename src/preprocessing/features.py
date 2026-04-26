@@ -95,7 +95,9 @@ def build_features_actuales(df_deudores: pd.DataFrame) -> pd.DataFrame:
 def build_features_temporales(df_24dsf: pd.DataFrame) -> pd.DataFrame:
     """
     Valida y normaliza las features temporales (24DSF) ya agregadas.
-    El DataFrame esperado viene de cargar_24dsf(), con una fila por CUIT.
+    El DataFrame esperado viene de cargar_24dsf(), con una fila por CUIT,
+    y features calculadas solo con meses 7-24 (mes 7 es el mas reciente
+    disponible como feature).
 
     Retorna un DataFrame con una fila por CUIT.
     """

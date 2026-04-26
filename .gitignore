@@ -31,3 +31,4 @@ dist/
 # Local data outputs
 data/
 data_processed/
+agents

@@ -1,18 +1,25 @@
 """
 build_dataset.py
 ----------------
-Script principal del pipeline de datos. Ejecutar desde la raíz del repo:
+Script principal del pipeline de datos. Ejecutar desde src/:
 
-    python src/build_dataset.py
+    uv run python build_dataset.py
 
-Genera data_processed/dataset_final.csv listo para entrenar el modelo.
+Genera data_processed/dataset_final.csv listo para entrenar el modelo de scoring.
+
+El dataset contiene una fila por CUIT con:
+    - Features actuales (de deudores.txt)
+    - Features temporales calculadas sobre meses 7-24 del 24DSF
+    - Target real: score_crediticio (float 0-1, derivado de meses 1-6 del 24DSF)
+
+IMPORTANTE: el 24DSF.txt es obligatorio. Sin el no hay target y el pipeline no corre.
 
 Estructura de carpetas esperada:
     data/
     ├── 202602DEUDORES/
     │   └── deudores.txt
-    └── 24DSF202602/           ← opcional, puede no estar todavía
-        └── 24DSF.txt
+    └── 24DSF202602/
+        └── 24DSF.txt          ← obligatorio
     data_processed/
     └── dataset_final.csv      ← output
 """
@@ -20,9 +27,9 @@ Estructura de carpetas esperada:
 import pandas as pd
 from pathlib import Path
 
-from load_data import cargar_deudores, cargar_24dsf
-from features import combinar_features
-from targets import generar_targets
+from preprocessing.load_data import cargar_deudores, cargar_24dsf
+from preprocessing.features import combinar_features
+from preprocessing.targets import generar_targets
 
 
 # ── Configuración de rutas ───────────────────────────────────────────────────
@@ -44,6 +51,7 @@ PERSONA_HUMANA_ONLY = True
 # ── Columnas finales del dataset de entrenamiento ────────────────────────────
 
 FEATURES_NUMERICAS = [
+    # Features actuales (de deudores.txt)
     'situacion',
     'prestamos_total',
     'dias_atraso_max',
@@ -54,7 +62,7 @@ FEATURES_NUMERICAS = [
     'recategorizado',
     'irrecuperable',
     'cant_entidades',
-    # Features temporales (NaN si no hay 24DSF todavía)
+    # Features temporales — calculadas sobre meses 7-24 del 24DSF
     'meses_en_sit1',
     'meses_sit_mala',
     'peor_situacion_24m',
@@ -71,9 +79,7 @@ FEATURES_CATEGORICAS = [
 ]
 
 TARGETS = [
-    'monto_sugerido',
-    'cuotas_cod',
-    'cuotas_valor',
+    'score_crediticio',
 ]
 
 
@@ -108,10 +114,10 @@ def _validar_columnas(df: pd.DataFrame, esperadas: list[str], nombre_df: str) ->
 def _validar_rangos_temporales(df: pd.DataFrame) -> None:
     """Valida rangos básicos para detectar errores de parseo/agregación."""
     checks = {
-        'meses_en_sit1': (0, 24),
-        'meses_sit_mala': (0, 24),
-        'racha_sit1_actual': (0, 24),
-        'meses_con_deuda': (0, 24),
+        'meses_en_sit1': (0, 18),
+        'meses_sit_mala': (0, 18),
+        'racha_sit1_actual': (0, 18),
+        'meses_con_deuda': (0, 18),
         'peor_situacion_24m': (1, 5),
     }
 
@@ -141,10 +147,7 @@ def main():
         DEUDORES_DIR / 'deudores.txt',
         DEUDORES_DIR / 'deudores_test.txt',
     )
-    dsf24_path = _resolver_path_preferido(
-        DSF24_DIR / '24DSF.txt',
-        DSF24_DIR / '24DSF_test.txt',
-    )
+    dsf24_path = DSF24_DIR / '24DSF.txt'
 
     if deudores_path is None:
         raise FileNotFoundError(
@@ -152,10 +155,7 @@ def main():
         )
 
     print(f"Archivo deudores: {deudores_path.name}")
-    if dsf24_path is not None:
-        print(f"Archivo 24DSF:    {dsf24_path.name}")
-    else:
-        print("Archivo 24DSF:    no disponible (opcional)")
+    print(f"Archivo 24DSF:    {dsf24_path.name}")
     print(
         "Filtro personas humanas: "
         + ("activo (20/23/24/27)" if PERSONA_HUMANA_ONLY else "desactivado")
@@ -179,27 +179,38 @@ def main():
     if df_actuales['nro_id'].duplicated().any():
         raise ValueError('df_actuales tiene CUITs duplicados; se esperaba una fila por nro_id')
 
-    # ── 2. Cargar 24DSF.txt (si está disponible) ─────────────
+    # ── 2. Cargar 24DSF.txt (obligatorio) ────────────────────
     df_temporales = None
-    if dsf24_path is not None:
-        df_temporales = cargar_24dsf(
-            dsf24_path,
-            persona_humana_only=PERSONA_HUMANA_ONLY,
+    df_target = None
+    if not dsf24_path.exists():
+        print('ERROR: 24DSF.txt es obligatorio para generar el score real.')
+        print('       El pipeline no puede continuar sin este archivo.')
+        return
+
+    df_temporales, df_target = cargar_24dsf(
+        dsf24_path,
+        persona_humana_only=PERSONA_HUMANA_ONLY,
+    )
+    _validar_columnas(df_temporales, ['nro_id', *TEMPORALES_ESPERADAS], 'df_temporales')
+    if df_temporales['nro_id'].duplicated().any():
+        raise ValueError('df_temporales tiene CUITs duplicados; se esperaba una fila por nro_id')
+    _validar_rangos_temporales(df_temporales)
+    _validar_columnas(df_target, ['nro_id', 'score_crediticio'], 'df_target')
+    if df_target['nro_id'].duplicated().any():
+        raise ValueError('df_target tiene CUITs duplicados; se esperaba una fila por nro_id')
+    invalid_target = (~df_target['score_crediticio'].between(0.0, 1.0)).sum()
+    if invalid_target:
+        raise ValueError(
+            f"df_target contiene {invalid_target:,} filas con score_crediticio fuera de [0.0, 1.0]"
         )
-        _validar_columnas(df_temporales, ['nro_id', *TEMPORALES_ESPERADAS], 'df_temporales')
-        if df_temporales['nro_id'].duplicated().any():
-            raise ValueError('df_temporales tiene CUITs duplicados; se esperaba una fila por nro_id')
-        _validar_rangos_temporales(df_temporales)
-    else:
-        print(f"\n⚠  24DSF.txt no encontrado en {DSF24_DIR}")
-        print("   Continuando solo con features actuales.")
-        print("   Las features temporales quedarán en NaN hasta que esté disponible.\n")
+    if df_target['score_crediticio'].isna().any():
+        raise ValueError('df_target contiene valores NaN en score_crediticio')
 
     # ── 3. Combinar ambas fuentes ─────────────────────────────
     df_features = combinar_features(df_actuales, df_temporales)
 
     # ── 4. Generar targets ────────────────────────────────────
-    df_final = generar_targets(df_features)
+    df_final = generar_targets(df_features, df_target)
     _validar_columnas(df_final, TARGETS, 'df_final')
 
     # ── 5. Seleccionar columnas finales ───────────────────────
@@ -210,8 +221,6 @@ def main():
         + TARGETS
     )
 
-    # Si no hay 24DSF, combinar_features ya crea temporales en NaN,
-    # así que todas las columnas esperadas deberían existir.
     _validar_columnas(df_final, columnas_finales, 'df_final (columnas exportables)')
     df_export = df_final[columnas_finales]
 
