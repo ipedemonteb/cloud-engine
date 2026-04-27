@@ -32,3 +32,4 @@ dist/
 data/
 data_processed/
 agents
+src/artifacts
