@@ -31,5 +31,11 @@ dist/
 # Local data outputs
 data/
 data_processed/
-agents
-src/artifacts
+
+# Model artifacts
+artifacts/*
+!artifacts/.gitkeep
+src/model/artifacts/
+
+# Agents
+agents/

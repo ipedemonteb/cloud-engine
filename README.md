@@ -26,6 +26,29 @@ Salida esperada:
 
 - `src/data_processed/dataset_final.csv`
 
+## Entrenamiento del modelo
+
+El entrenamiento guarda los artefactos en `artifacts/` (no versionado).
+Por defecto usa `data_processed/dataset_train_balanced.csv` como dataset.
+
+```bash
+uv run python src/model/train_model.py
+```
+
+Para indicar otro dataset:
+
+```bash
+uv run python src/model/train_model.py --dataset /ruta/a/tu_dataset.csv
+```
+
+## Prediccion
+
+El script de inferencia usa por defecto los artefactos en `artifacts/`.
+
+```bash
+uv run python src/model/predict.py --input /ruta/a/input.csv --output /ruta/a/predicciones.csv
+```
+
 ## Inputs esperados
 
 - `src/data/202602DEUDORES/deudores.txt` (o `deudores_test.txt`)

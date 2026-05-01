@@ -2,7 +2,7 @@
 Pipeline minimo de entrenamiento para modelo de scoring crediticio.
 
 Implementa los pasos de agents/MODEL.md:
-1) Carga dataset_final.csv
+1) Carga un dataset con el esquema de dataset_final.csv
 2) Separa X / y
 3) train/test split
 4) One-hot de actividad
@@ -11,6 +11,9 @@ Implementa los pasos de agents/MODEL.md:
 7) Entrenamiento
 8) Evaluacion
 9) Guardado de artefactos
+
+Por defecto usa data_processed/dataset_train_balanced.csv y guarda
+los artefactos en artifacts/ (no versionado).
 """
 
 from __future__ import annotations
@@ -35,8 +38,9 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.models import Sequential
+from keras import Input
+from keras.layers import Dense
+from keras.models import Sequential
 
 
 DEFAULT_RANDOM_STATE = 42
@@ -52,9 +56,16 @@ SCORE_BINS = [0.0, 0.25, 0.50, 0.75, 1.000001]
 SCORE_BIN_LABELS = ["b0_0_025", "b1_025_050", "b2_050_075", "b3_075_100"]
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
 def _default_dataset_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "data_processed" / "dataset_final.csv"
+    return _repo_root() / "data_processed" / "dataset_train_balanced.csv"
+
+
+def _default_artifacts_dir() -> Path:
+    return _repo_root() / "artifacts"
 
 
 def _resolve_dataset_path(dataset_path: str | None) -> Path:
@@ -82,6 +93,13 @@ def _validate_columns(df: pd.DataFrame) -> None:
 
 def _prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     X = df.drop(columns=[TARGET_COLUMN, ID_COLUMN])
+    for col in X.columns:
+        if col in CATEGORICAL_COLUMNS:
+            X[col] = X[col].fillna("desconocido").astype(str)
+        else:
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+
+    X = X.replace([np.inf, -np.inf], np.nan)
     y = df[TARGET_COLUMN]
     return X, y
 
@@ -89,7 +107,8 @@ def _prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
 def _build_model(input_dim: int) -> Sequential:
     model = Sequential(
         [
-            Dense(16, activation="relu", input_shape=(input_dim,)),
+            Input(shape=(input_dim,)),
+            Dense(16, activation="relu"),
             Dense(1, activation="sigmoid"),
         ]
     )
@@ -111,6 +130,21 @@ def _save_metrics(metrics: dict, output_path: Path) -> None:
     _ensure_parent_dir(output_path)
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=True, indent=2)
+
+
+def _save_fill_values(fill_values: dict[str, float], output_path: Path) -> None:
+    _ensure_parent_dir(output_path)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(fill_values, f, ensure_ascii=True, indent=2)
+
+
+def _assert_finite(name: str, values: np.ndarray) -> None:
+    nan_count = int(np.isnan(values).sum())
+    inf_count = int(np.isinf(values).sum())
+    if nan_count or inf_count:
+        raise ValueError(
+            f"{name} contiene valores no finitos: NaN={nan_count:,} inf={inf_count:,}"
+        )
 
 
 def _to_bins(values: np.ndarray) -> np.ndarray:
@@ -245,10 +279,14 @@ def _print_metricas_bins_clasificacion(metricas: dict) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    default_artifacts_dir = Path(__file__).resolve().parent / "artifacts"
+    default_artifacts_dir = _default_artifacts_dir()
 
     parser = argparse.ArgumentParser(description="Entrena un MLP para score_crediticio")
-    parser.add_argument("--dataset", default=None, help="Ruta a dataset_final.csv")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Ruta al dataset de entrenamiento (CSV)",
+    )
     parser.add_argument(
         "--model-output",
         default=str(default_artifacts_dir / "modelo_crediticio.keras"),
@@ -263,6 +301,11 @@ def parse_args() -> argparse.Namespace:
         "--columns-output",
         default=str(default_artifacts_dir / "feature_columns.json"),
         help="Ruta de salida de columnas de entrenamiento",
+    )
+    parser.add_argument(
+        "--fill-values-output",
+        default=str(default_artifacts_dir / "feature_fill_values.json"),
+        help="Ruta de salida de valores de imputacion por feature",
     )
     parser.add_argument(
         "--metrics-output",
@@ -283,7 +326,7 @@ def main() -> None:
 
     dataset_path = _resolve_dataset_path(args.dataset)
     if not dataset_path.exists():
-        raise FileNotFoundError(f"No se encontro dataset_final.csv en: {dataset_path}")
+        raise FileNotFoundError(f"No se encontro dataset de entrenamiento en: {dataset_path}")
 
     io_start = time.perf_counter()
     print(f"Cargando dataset: {dataset_path}")
@@ -307,11 +350,24 @@ def main() -> None:
     X_test = pd.get_dummies(X_test, columns=CATEGORICAL_COLUMNS)
     X_train, X_test = X_train.align(X_test, join="left", axis=1, fill_value=0)
 
+    X_train = X_train.replace([np.inf, -np.inf], np.nan)
+    X_test = X_test.replace([np.inf, -np.inf], np.nan)
+
+    fill_series = X_train.median(numeric_only=True)
+    X_train = X_train.fillna(fill_series).fillna(0.0)
+    X_test = X_test.fillna(fill_series).fillna(0.0)
+
     feature_columns = list(X_train.columns)
+    feature_fill_values = {
+        col: float(fill_series.get(col, 0.0))
+        for col in feature_columns
+    }
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
+    _assert_finite("X_train_scaled", X_train_scaled)
+    _assert_finite("X_test_scaled", X_test_scaled)
     prep_seconds = time.perf_counter() - prep_start
 
     train_start = time.perf_counter()
@@ -332,6 +388,8 @@ def main() -> None:
 
     preds_test = model.predict(X_test_scaled, verbose=0).reshape(-1)
     preds_train = model.predict(X_train_scaled, verbose=0).reshape(-1)
+    _assert_finite("preds_test", preds_test)
+    _assert_finite("preds_train", preds_train)
     eval_seconds = time.perf_counter() - eval_start
 
     baseline_pred = np.full_like(y_test_np, fill_value=float(np.mean(y_train_np)), dtype=float)
@@ -357,6 +415,7 @@ def main() -> None:
     model_output = Path(args.model_output).expanduser().resolve()
     scaler_output = Path(args.scaler_output).expanduser().resolve()
     columns_output = Path(args.columns_output).expanduser().resolve()
+    fill_values_output = Path(args.fill_values_output).expanduser().resolve()
     metrics_output = Path(args.metrics_output).expanduser().resolve()
 
     _ensure_parent_dir(model_output)
@@ -366,6 +425,7 @@ def main() -> None:
     joblib.dump(scaler, scaler_output)
 
     _save_feature_columns(feature_columns, columns_output)
+    _save_fill_values(feature_fill_values, fill_values_output)
 
     train_history = history.history
     metrics_payload = {
@@ -407,6 +467,7 @@ def main() -> None:
     print(f"Modelo guardado en: {model_output}")
     print(f"Scaler guardado en: {scaler_output}")
     print(f"Columnas guardadas en: {columns_output}")
+    print(f"Fill values guardados en: {fill_values_output}")
     print(f"Metricas guardadas en: {metrics_output}")
 
 
